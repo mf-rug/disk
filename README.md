@@ -7,7 +7,7 @@ A pretty disk usage analysis tool for macOS. One command to see what's eating yo
 ## Install
 
 ```bash
-curl -o ~/.local/bin/disk https://raw.githubusercontent.com/maxfurst/disk/main/disk
+curl -o ~/.local/bin/disk https://raw.githubusercontent.com/mf-rug/disk/master/disk
 chmod +x ~/.local/bin/disk
 ```
 
@@ -28,8 +28,9 @@ $ disk
   ██████████████████████████░░░░  851 GB / 995 GB used (86%)
   107 GB available
 
-  webdav.data.rug.nl — Network
-  (usage unavailable)
+  Backup Drive — External (USB)
+  ████████░░░░░░░░░░░░░░░░░░░░░░  320 GB / 1.0 TB used (32%)
+  680 GB available
 ```
 
 Shows all connected physical disks with color-coded usage bars. The boot volume is marked with ★. Filters out system partitions, APFS snapshots, and virtual mounts.
@@ -41,11 +42,11 @@ $ disk -d
 
   Storage Breakdown
   ──────────────────────────────────────────────────────────────
-  Pictures           320.3 GB  █████░░░░░░░░░░░   32.2%  146.9k files
-  Documents          176.8 GB  ███░░░░░░░░░░░░░   17.8%   64.0k files
+  Photos             220.3 GB  █████░░░░░░░░░░░   22.1%  84.2k files
+  Documents          176.8 GB  ███░░░░░░░░░░░░░   17.8%  64.0k files
   macOS System       114.7 GB  ██░░░░░░░░░░░░░░   11.5%
-  Applications        64.5 GB  █░░░░░░░░░░░░░░░    6.5%  571.8k files
-  Caches & App Data   16.9 GB  ░░░░░░░░░░░░░░░░    1.7%  211.6k files
+  Applications        64.5 GB  █░░░░░░░░░░░░░░░    6.5%  42.1k files
+  Caches & App Data   16.9 GB  ░░░░░░░░░░░░░░░░    1.7%  31.6k files
   ...
   ──────────────────────────────────────────────────────────────
   Free Space         130.9 GB  ░░░░░░░░░░░░░░░░   13.2%
@@ -62,9 +63,9 @@ $ disk -c
   ─────────────────────────────────────────────────────────────────
   Safe =auto-regenerated cache    Review =check first    Caution =inspect before deleting
   ─────────────────────────────────────────────────────────────────
-  [Safe]    Conda package cache         9.5 GB
-            Cached conda packages — can be re-downloaded
-            rm -rf ~/anaconda3/pkgs
+  [Safe]    Homebrew cache              3.2 GB
+            Downloaded bottles and source archives
+            brew cleanup --prune=all
 
   [Review]  DMGs in Downloads         509.6 MB
             Disk images — usually safe to delete after installing apps
@@ -74,7 +75,7 @@ $ disk -c
             Could be anything — review before bulk-deleting
             ls -lhS ~/Downloads/*.zip  (review, then delete selectively)
   ─────────────────────────────────────────────────────────────────
-  Total reclaimable                   36.2 GB
+  Total reclaimable                   18.4 GB
 ```
 
 Scans for reclaimable space across caches, downloads, build artifacts, and more. Each suggestion is color-coded by risk level with a ready-to-run cleanup command.
@@ -99,9 +100,9 @@ $ disk -b
 
   Biggest files in /
   ──────────────────────────────────────────────────────────────────────
-     18.0 GB  1.2y ago  ~/Documents/code/wikigrep/enwiki-latest-pages-articles.xml.bz2
-      7.0 GB  1.4y ago  ~/Documents/work/Teaching/.syncthing.SB_Transcription.mov.tmp
-      5.6 GB  1.2y ago  ~/Documents/code/wikigrep/enwiki-latest-pages-articles.xml.bz2.2
+     18.0 GB  1.2y ago  ~/Downloads/ubuntu-24.04-desktop-amd64.iso
+      5.6 GB  2.1y ago  ~/Movies/vacation-2024.mov
+      2.4 GB   5mo ago  ~/Library/Android/sdk/system-images/android-35/system.img
   ──────────────────────────────────────────────────────────────────────
 ```
 
@@ -110,16 +111,16 @@ Finds the 20 largest files. Color-coded by age — older files (yellow >6mo, red
 ### Directory breakdown
 
 ```
-$ disk ~/Documents
+$ disk ~/Projects
 
-  /Users/max/Documents
-  176.7 GB total, 64.0k files
+  /Users/jane/Projects
+  48.2 GB total, 124.5k files
 
   ──────────────────────────────────────────────────────────
-  work              86.4 GB  ████████░░░░░░░░   48.9%  38.4k files
-  Vuze Downloads    38.7 GB  ████░░░░░░░░░░░░   21.9%  292 files
-  code              29.2 GB  ███░░░░░░░░░░░░░   16.5%  21.5k files
-  Other              4.9 GB  ░░░░░░░░░░░░░░░░    2.8%  3.7k files
+  webapp            22.1 GB  ███████░░░░░░░░░░   45.9%  68.3k files
+  ml-models         14.8 GB  █████░░░░░░░░░░░░   30.7%  1.2k files
+  scripts            6.4 GB  ██░░░░░░░░░░░░░░░   13.3%  12.4k files
+  Other              4.9 GB  ░░░░░░░░░░░░░░░░░    2.8%  3.7k files
   ──────────────────────────────────────────────────────────
 ```
 
