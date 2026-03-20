@@ -1,0 +1,1104 @@
+#!/usr/bin/env python3
+"""Pretty disk usage analysis tool for macOS."""
+
+import argparse
+import os
+import stat as stat_module
+import subprocess
+import sys
+
+
+# ── ANSI colors ──────────────────────────────────────────────────────────────
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def bold(t):
+    return c("1", t)
+
+
+def dim(t):
+    return c("2", t)
+
+
+def green(t):
+    return c("32", t)
+
+
+def yellow(t):
+    return c("33", t)
+
+
+def red(t):
+    return c("31", t)
+
+
+def cyan(t):
+    return c("36", t)
+
+
+def color_for_pct(pct):
+    if pct < 60:
+        return green
+    elif pct < 80:
+        return yellow
+    return red
+
+
+# ── Size formatting ──────────────────────────────────────────────────────────
+
+
+def fmt_bytes(n):
+    """Format bytes into human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000:
+            if unit in ("B", "KB"):
+                return f"{n:.0f} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} PB"
+
+
+# ── Progress bar ─────────────────────────────────────────────────────────────
+
+BAR_WIDTH = 30
+
+
+def bar(pct, width=BAR_WIDTH):
+    filled = int(round(pct / 100 * width))
+    empty = width - filled
+    colorize = color_for_pct(pct)
+    return colorize("█" * filled) + dim("░" * empty)
+
+
+# ── Disk discovery ───────────────────────────────────────────────────────────
+
+# Mount points to always skip
+SKIP_MOUNTS = {
+    "/dev",
+    "/System/Volumes/VM",
+    "/System/Volumes/Preboot",
+    "/System/Volumes/Update",
+    "/System/Volumes/xarts",
+    "/System/Volumes/iSCPreboot",
+    "/System/Volumes/Hardware",
+    "/System/Volumes/Data/home",
+    "/System/Volumes/Update/mnt1",
+    "/System/Volumes/Update/SFR/mnt1",
+}
+
+# Filesystem types to skip
+SKIP_FS = {"devfs", "map"}
+
+
+def get_diskutil_info(device):
+    """Get volume info from diskutil."""
+    try:
+        r = subprocess.run(
+            ["diskutil", "info", device],
+            capture_output=True, text=True, timeout=5,
+        )
+        info = {}
+        for line in r.stdout.splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                info[key.strip()] = val.strip()
+        return info
+    except Exception:
+        return {}
+
+
+def parse_df_line(line):
+    """Parse a df -b line into (filesystem, blocks_total, blocks_used, blocks_avail, mount).
+
+    df -b columns: Filesystem 512-blocks Used Available Capacity Mounted-on
+    The mount point may contain spaces, so we split carefully.
+    """
+    parts = line.split()
+    if len(parts) < 6:
+        return None
+    fs = parts[0]
+    try:
+        total = int(parts[1])
+        used = int(parts[2])
+        avail = int(parts[3])
+    except ValueError:
+        return None
+    # parts[4] is Capacity%, mount is everything from parts[5] onward
+    mount = " ".join(parts[5:])
+    return fs, total, used, avail, mount
+
+
+def get_disks():
+    """Parse df and return list of meaningful disks."""
+    r = subprocess.run(["df", "-b"], capture_output=True, text=True)
+    disks = []
+    boot_device = None
+
+    lines = r.stdout.splitlines()[1:]
+
+    # Parse all lines first
+    parsed = [parse_df_line(l) for l in lines]
+    parsed = [p for p in parsed if p is not None]
+
+    # Find the boot device (root mount)
+    for fs, _, _, _, mount in parsed:
+        if mount == "/":
+            boot_device = fs.replace("/dev/", "").split("s")[0]
+            break
+
+    seen_containers = set()
+
+    for fs, blocks_total, blocks_used, blocks_avail, mount in parsed:
+        # Skip virtual/system mounts
+        if mount in SKIP_MOUNTS:
+            continue
+        if any(fs.startswith(s) for s in SKIP_FS):
+            continue
+
+        # For APFS, only keep the Data volume (or root if no Data seen)
+        device = fs.replace("/dev/", "")
+        container = device.split("s")[0] if device.startswith("disk") else None
+
+        if container and container in seen_containers:
+            continue
+
+        # Detect if this is the main APFS data volume or root
+        is_data = mount == "/System/Volumes/Data"
+        is_root = mount == "/"
+
+        if is_data and container:
+            seen_containers.add(container)
+        elif is_root and container:
+            # Skip root if we'll see Data volume for same container
+            has_data = any(
+                m == "/System/Volumes/Data"
+                for f, _, _, _, m in parsed
+                if f.replace("/dev/", "").split("s")[0] == container
+            )
+            if has_data:
+                continue
+            seen_containers.add(container)
+
+        # Convert 512-byte blocks to bytes
+        total = blocks_total * 512
+        used = blocks_used * 512
+        avail = blocks_avail * 512
+
+        # Get disk info
+        info = get_diskutil_info(fs) if fs.startswith("/dev/") else {}
+        vol_name = info.get("Volume Name", "")
+        media_type = info.get("Media Type", "")
+        protocol = info.get("Protocol", "")
+        virtual = info.get("Virtual", "No")
+
+        # Determine disk type label
+        is_boot = container and container == boot_device
+        if fs.startswith("http") or fs.startswith("smb") or fs.startswith("nfs") or fs.startswith("afp"):
+            disk_type = "Network"
+            vol_name = vol_name or mount.split("/")[-1]
+        elif virtual == "Yes" or "disk image" in media_type.lower():
+            disk_type = "Disk Image"
+        elif is_boot:
+            disk_type = f"Internal SSD ({protocol})" if protocol else "Internal SSD"
+            vol_name = "Macintosh HD"
+        elif protocol in ("USB", "Thunderbolt"):
+            disk_type = f"External ({protocol})"
+        elif protocol:
+            disk_type = f"Internal ({protocol})"
+        else:
+            disk_type = "Volume"
+
+        if not vol_name:
+            vol_name = mount.split("/")[-1] or mount
+
+        disks.append({
+            "name": vol_name,
+            "type": disk_type,
+            "mount": mount,
+            "device": fs,
+            "total": total,
+            "used": used,
+            "avail": avail,
+            "is_boot": is_boot,
+        })
+
+    # Sort: boot drive first, then by name
+    disks.sort(key=lambda d: (not d["is_boot"], d["name"].lower()))
+    return disks
+
+
+# ── Default display ──────────────────────────────────────────────────────────
+
+
+def print_disks(disks):
+    print()
+    for i, d in enumerate(disks):
+        star = "★ " if d["is_boot"] else ""
+        print(f"  {bold(star + d['name'])} {dim('—')} {dim(d['type'])}")
+
+        if d["total"] > 0:
+            pct = d["used"] / d["total"] * 100 if d["total"] else 0
+            colorize = color_for_pct(pct)
+            print(f"  {bar(pct)}  {fmt_bytes(d['used'])} / {fmt_bytes(d['total'])} used ({colorize(f'{pct:.0f}%')})")
+            print(f"  {fmt_bytes(d['avail'])} available")
+        else:
+            print(f"  {dim('(usage unavailable)')}")
+
+        if i < len(disks) - 1:
+            print()
+    print()
+
+
+# ── Detailed breakdown ───────────────────────────────────────────────────────
+
+
+def du_size(path):
+    """Get total size of a path in bytes using du."""
+    try:
+        r = subprocess.run(
+            ["du", "-sk", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.split()[0]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def file_count(path):
+    """Count files in a directory (fast — just reads dir entries)."""
+    try:
+        r = subprocess.run(
+            ["find", path, "-type", "f"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=30,
+        )
+        if r.returncode in (0, 1):  # 1 = some permission errors, still has output
+            return r.stdout.count("\n")
+    except Exception:
+        pass
+    return 0
+
+
+def fmt_count(n):
+    """Format file count with thousands separators."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M files"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k files"
+    return f"{n} files"
+
+
+def scan_categories(home, total_used):
+    """Scan home directory and /Applications for storage breakdown.
+
+    Returns (categories, system_size) where categories is a list of
+    (name, size, count) tuples.
+    """
+    categories = []
+
+    # Scan ~/  subdirectories
+    try:
+        entries = sorted(os.listdir(home))
+    except OSError:
+        entries = []
+
+    print(f"  {dim('Scanning storage...')}", end="", flush=True)
+
+    for entry in entries:
+        path = os.path.join(home, entry)
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        size = du_size(path)
+        if size > 0:
+            count = file_count(path)
+            categories.append((entry, size, count))
+        print(dim("."), end="", flush=True)
+
+    # /Applications
+    apps_size = du_size("/Applications")
+    if apps_size > 0:
+        apps_count = file_count("/Applications")
+        categories.append(("Applications", apps_size, apps_count))
+    print(dim("."), end="", flush=True)
+
+    # Sort by size descending
+    categories.sort(key=lambda x: -x[1])
+
+    # Calculate system/other
+    accounted = sum(s for _, s, _ in categories)
+    system_size = max(0, total_used - accounted)
+
+    # Clear scanning line
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+
+    return categories, system_size
+
+
+def print_details(disks):
+    # Find boot disk
+    boot = next((d for d in disks if d["is_boot"]), None)
+    if not boot:
+        print(f"  {red('Could not identify boot volume.')}")
+        return
+
+    home = os.path.expanduser("~")
+    categories, system_size = scan_categories(home, boot["used"])
+
+    # Group: hidden dirs → "Caches & App Data", small entries → "Other"
+    visible = []
+    hidden_total = 0
+    hidden_count = 0
+    other_total = 0
+    other_count = 0
+    for name, size, count in categories:
+        if name.startswith("."):
+            hidden_total += size
+            hidden_count += count
+        elif size >= 500_000_000:  # 500 MB
+            visible.append((name, size, count))
+        else:
+            other_total += size
+            other_count += count
+
+    # Build final list: (name, size, count)
+    final = list(visible)
+    if hidden_total > 0:
+        final.append(("Caches & App Data", hidden_total, hidden_count))
+    if system_size > 0:
+        final.append(("macOS System", system_size, 0))
+    if other_total > 0:
+        final.append(("Other", other_total, other_count))
+
+    # Sort by size descending
+    final.sort(key=lambda x: -x[1])
+
+    # Find max name length for alignment
+    max_name = max(len(n) for n, _, _ in final) if final else 10
+    max_name = max(max_name, 18)
+
+    # Add free space so everything sums to 100%
+    final.append(("Free Space", boot["avail"], 0))
+
+    # Print
+    print(f"  {bold('Storage Breakdown')}")
+    line_width = max_name + 48
+    print(f"  {dim('─' * line_width)}")
+
+    total = boot["total"]
+    detail_bar_width = 16
+    for name, size, count in final:
+        pct = size / total * 100 if total else 0
+        filled = int(round(pct / 100 * detail_bar_width))
+        empty = detail_bar_width - filled
+        count_str = dim(fmt_count(count)) if count > 0 else ""
+        is_free = name == "Free Space"
+        if is_free:
+            print(f"  {dim('─' * line_width)}")
+            bar_str = dim("░" * detail_bar_width)
+            size_str = f"{fmt_bytes(size):>9}"
+            pct_str = f"{pct:>5.1f}%"
+            print(f"  {dim(f'{name:<{max_name}}')}  {dim(size_str)}  {bar_str}  {dim(pct_str)}")
+        else:
+            colorize = color_for_pct(pct * (100 / max(1, boot["used"] / boot["total"] * 100)))
+            bar_str = colorize("█" * filled) + dim("░" * empty)
+            print(f"  {name:<{max_name}}  {fmt_bytes(size):>9}  {bar_str}  {pct:>5.1f}%  {count_str}")
+
+    print()
+
+
+# ── Cleanup suggestions ─────────────────────────────────────────────────────
+
+import glob as globmod
+
+
+def glob_size(pattern):
+    """Total size of files matching a glob pattern."""
+    total = 0
+    for path in globmod.glob(pattern):
+        try:
+            if os.path.isfile(path) and not os.path.islink(path):
+                total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
+def dir_size_if_exists(path):
+    """Size of a directory, 0 if missing."""
+    if os.path.isdir(path):
+        return du_size(path)
+    return 0
+
+
+# Risk levels for cleanup targets
+SAFE = "safe"        # pure caches, auto-regenerated — delete freely
+REVIEW = "review"    # probably fine, but worth a quick look first
+CAUTION = "caution"  # may contain files you actually want
+
+RISK_LABELS = {
+    SAFE:    ("Safe",    green,  "auto-regenerated cache, safe to delete"),
+    REVIEW:  ("Review",  yellow, "probably fine, but check first"),
+    CAUTION: ("Caution", red,    "may contain files you want — inspect before deleting"),
+}
+
+
+def get_cleanup_targets(home):
+    """Return list of (name, description, size, cleanup_hint, risk) tuples."""
+    targets = []
+
+    def add(name, desc, size, hint, risk=SAFE):
+        if size > 0:
+            targets.append((name, desc, size, hint, risk))
+
+    # Trash
+    add("Trash",
+        "Files in the Trash — you already deleted these once",
+        dir_size_if_exists(os.path.join(home, ".Trash")),
+        "Empty via Finder or: rm -rf ~/.Trash/*",
+        REVIEW)
+
+    # DMGs in Downloads
+    add("DMGs in Downloads",
+        "Disk images — usually safe to delete after installing apps",
+        glob_size(os.path.join(home, "Downloads", "*.dmg")),
+        "rm ~/Downloads/*.dmg",
+        REVIEW)
+
+    # ZIPs in Downloads
+    add("ZIPs in Downloads",
+        "Could be anything — review before bulk-deleting",
+        glob_size(os.path.join(home, "Downloads", "*.zip")),
+        "ls -lhS ~/Downloads/*.zip  (review, then delete selectively)",
+        CAUTION)
+
+    # PKGs in Downloads
+    add("Installers in Downloads",
+        "macOS installer packages — safe to delete after installation",
+        glob_size(os.path.join(home, "Downloads", "*.pkg")),
+        "rm ~/Downloads/*.pkg",
+        REVIEW)
+
+    # Xcode DerivedData
+    add("Xcode DerivedData",
+        "Build artifacts — Xcode will regenerate as needed",
+        dir_size_if_exists(os.path.join(home, "Library", "Developer",
+                                        "Xcode", "DerivedData")),
+        "rm -rf ~/Library/Developer/Xcode/DerivedData")
+
+    # Xcode iOS device support
+    add("Xcode Device Support",
+        "Old iOS version support files",
+        dir_size_if_exists(os.path.join(home, "Library", "Developer",
+                                        "Xcode", "iOS DeviceSupport")),
+        "rm -rf ~/Library/Developer/Xcode/iOS\\ DeviceSupport/*",
+        REVIEW)
+
+    # Homebrew cache
+    add("Homebrew cache",
+        "Downloaded bottles and source archives",
+        dir_size_if_exists(os.path.join(home, "Library", "Caches",
+                                        "Homebrew")),
+        "brew cleanup --prune=all")
+
+    # pip cache
+    pip_cache = dir_size_if_exists(os.path.join(home, "Library", "Caches", "pip"))
+    if pip_cache == 0:
+        pip_cache = dir_size_if_exists(os.path.join(home, ".cache", "pip"))
+    add("pip cache",
+        "Cached Python package downloads",
+        pip_cache,
+        "pip cache purge")
+
+    # Conda packages
+    add("Conda package cache",
+        "Cached conda packages — can be re-downloaded",
+        dir_size_if_exists(os.path.join(home, "anaconda3", "pkgs")),
+        "rm -rf ~/anaconda3/pkgs")
+
+    # npm cache
+    add("npm cache",
+        "Cached npm packages",
+        dir_size_if_exists(os.path.join(home, ".npm", "_cacache")),
+        "npm cache clean --force")
+
+    # Gradle caches
+    add("Gradle cache",
+        "Build caches and downloaded dependencies",
+        dir_size_if_exists(os.path.join(home, ".gradle", "caches")),
+        "rm -rf ~/.gradle/caches")
+
+    # Cargo registry
+    cargo_reg = dir_size_if_exists(os.path.join(home, ".cargo", "registry"))
+    cargo_git = dir_size_if_exists(os.path.join(home, ".cargo", "git"))
+    add("Cargo cache",
+        "Cached Rust crate sources and git repos",
+        cargo_reg + cargo_git,
+        "rm -rf ~/.cargo/registry ~/.cargo/git")
+
+    # ~/Library/Logs
+    add("Application logs",
+        "Log files from various apps — useful if debugging issues",
+        dir_size_if_exists(os.path.join(home, "Library", "Logs")),
+        "rm -rf ~/Library/Logs/*",
+        REVIEW)
+
+    # Crash reports & diagnostics
+    diag_size = (
+        dir_size_if_exists(os.path.join(home, "Library", "Logs", "DiagnosticReports"))
+        + dir_size_if_exists("/Library/Logs/DiagnosticReports")
+        + dir_size_if_exists(os.path.join(home, "Library", "Application Support", "CrashReporter"))
+    )
+    add("Crash reports",
+        "App crash logs and diagnostic data — useful if diagnosing recurring crashes",
+        diag_size,
+        "rm -rf ~/Library/Logs/DiagnosticReports/* ~/Library/Application\\ Support/CrashReporter/*",
+        REVIEW)
+
+    # ── ~/Library/Caches — scan top offenders individually ──
+    lib_caches = os.path.join(home, "Library", "Caches")
+    # Dirs we already report separately (avoid double-counting)
+    already_reported_caches = {
+        "Homebrew", "pip",
+        "Google",  # Chrome cache
+        "Firefox",
+        "BraveSoftware",
+        "Microsoft Edge",
+        "com.apple.Safari",
+        "us.zoom.xos",
+    }
+    if os.path.isdir(lib_caches):
+        cache_entries = []
+        try:
+            for entry in os.listdir(lib_caches):
+                if entry in already_reported_caches:
+                    continue
+                path = os.path.join(lib_caches, entry)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    size = du_size(path)
+                    if size >= 100_000_000:  # 100 MB+
+                        cache_entries.append((entry, size))
+        except OSError:
+            pass
+        cache_entries.sort(key=lambda x: -x[1])
+        for entry, size in cache_entries:
+            add(f"Cache: {entry}",
+                "App cache — will be regenerated on next use",
+                size,
+                f"rm -rf ~/Library/Caches/{entry}")
+
+    # ── Browser caches ──
+    # Chrome
+    chrome_base = os.path.join(home, "Library", "Application Support", "Google", "Chrome")
+    chrome_cache = (
+        dir_size_if_exists(os.path.join(home, "Library", "Caches", "Google", "Chrome"))
+        + dir_size_if_exists(os.path.join(chrome_base, "Default", "Service Worker"))
+        + dir_size_if_exists(os.path.join(chrome_base, "Default", "Code Cache"))
+        + dir_size_if_exists(os.path.join(chrome_base, "Default", "GPUCache"))
+        + dir_size_if_exists(os.path.join(chrome_base, "ShaderCache"))
+    )
+    add("Chrome cache",
+        "Browser cache, service workers, shader/GPU cache",
+        chrome_cache,
+        "rm -rf ~/Library/Caches/Google/Chrome/ "
+        "~/Library/Application\\ Support/Google/Chrome/Default/{Service\\ Worker,Code\\ Cache,GPUCache} "
+        "~/Library/Application\\ Support/Google/Chrome/ShaderCache")
+
+    # Firefox
+    ff_cache = (
+        dir_size_if_exists(os.path.join(home, "Library", "Caches", "Firefox"))
+        + dir_size_if_exists(os.path.join(home, ".cache", "mozilla"))
+    )
+    add("Firefox cache",
+        "Browser cache files",
+        ff_cache,
+        "rm -rf ~/Library/Caches/Firefox/ ~/.cache/mozilla/")
+
+    # Brave
+    brave_base = os.path.join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser")
+    brave_cache = (
+        dir_size_if_exists(os.path.join(home, "Library", "Caches", "BraveSoftware"))
+        + dir_size_if_exists(os.path.join(brave_base, "Default", "Service Worker"))
+        + dir_size_if_exists(os.path.join(brave_base, "Default", "Code Cache"))
+        + dir_size_if_exists(os.path.join(brave_base, "Default", "GPUCache"))
+    )
+    add("Brave cache",
+        "Browser cache, service workers, GPU cache",
+        brave_cache,
+        "rm -rf ~/Library/Caches/BraveSoftware/ "
+        "~/Library/Application\\ Support/BraveSoftware/Brave-Browser/Default/{Service\\ Worker,Code\\ Cache,GPUCache}")
+
+    # Safari (just the cache dir, not cookies/data)
+    safari_cache = dir_size_if_exists(os.path.join(home, "Library", "Caches", "com.apple.Safari"))
+    add("Safari cache",
+        "Browser cache and webpage previews",
+        safari_cache,
+        "rm -rf ~/Library/Caches/com.apple.Safari/")
+
+    # Edge
+    edge_cache = dir_size_if_exists(os.path.join(home, "Library", "Caches", "Microsoft Edge"))
+    add("Edge cache",
+        "Browser cache files",
+        edge_cache,
+        "rm -rf ~/Library/Caches/Microsoft\\ Edge/")
+
+    # ── Electron app caches ──
+    electron_apps = {
+        "Discord":  "discord",
+        "Slack":    "Slack",
+        "VS Code":  "Code",
+        "Teams":    "Microsoft Teams",
+    }
+    for label, dirname in electron_apps.items():
+        app_base = os.path.join(home, "Library", "Application Support", dirname)
+        if not os.path.isdir(app_base):
+            continue
+        ecache = 0
+        for sub in ("Cache", "CachedData", "Code Cache", "GPUCache", "Service Worker"):
+            ecache += dir_size_if_exists(os.path.join(app_base, sub))
+        add(f"{label} cache",
+            "Electron app cache — will be regenerated",
+            ecache,
+            f"rm -rf ~/Library/Application\\ Support/{dirname}/{{Cache,CachedData,Code\\ Cache,GPUCache,Service\\ Worker}}")
+
+    # ── Zoom ──
+    zoom_cache = dir_size_if_exists(os.path.join(home, "Library", "Caches", "us.zoom.xos"))
+    zoom_logs = dir_size_if_exists(os.path.join(home, "Library", "Logs", "zoom.us"))
+    add("Zoom cache & logs",
+        "Zoom app cache and log files",
+        zoom_cache + zoom_logs,
+        "rm -rf ~/Library/Caches/us.zoom.xos/ ~/Library/Logs/zoom.us/")
+
+    zoom_recordings = dir_size_if_exists(os.path.join(home, "Documents", "Zoom"))
+    add("Zoom recordings",
+        "Local Zoom meeting recordings — review before deleting",
+        zoom_recordings,
+        "ls -lhS ~/Documents/Zoom/  (review, then delete selectively)",
+        CAUTION)
+
+    # iOS backups — smart duplicate detection
+    backup_dir = os.path.join(home, "Library", "Application Support",
+                              "MobileSync", "Backup")
+    if os.path.isdir(backup_dir):
+        import plistlib
+        from collections import defaultdict
+        devices = defaultdict(list)  # device_name -> [(date, path, size)]
+        try:
+            for entry in os.listdir(backup_dir):
+                entry_path = os.path.join(backup_dir, entry)
+                plist_path = os.path.join(entry_path, "Info.plist")
+                if not os.path.isfile(plist_path):
+                    continue
+                try:
+                    with open(plist_path, "rb") as f:
+                        info = plistlib.load(f)
+                    device = info.get("Device Name", "Unknown device")
+                    date = info.get("Last Backup Date")
+                    size = du_size(entry_path)
+                    devices[device].append((date, entry_path, size))
+                except Exception:
+                    continue
+        except OSError:
+            pass
+
+        for device, backups in devices.items():
+            total_size = sum(s for _, _, s in backups)
+            if len(backups) > 1:
+                backups.sort(key=lambda x: x[0] or "")
+                oldest_date = backups[0][0]
+                oldest_str = oldest_date.strftime("%Y-%m-%d") if oldest_date else "unknown date"
+                old_size = sum(s for _, _, s in backups[:-1])
+                add(f"iOS backups ({device})",
+                    f"{len(backups)} backups found — oldest from {oldest_str}. "
+                    f"Consider keeping only the latest",
+                    old_size,
+                    f"rm -rf {backups[0][1]}",
+                    CAUTION)
+            elif total_size > 0:
+                date_str = backups[0][0].strftime("%Y-%m-%d") if backups[0][0] else "unknown date"
+                add(f"iOS backup ({device})",
+                    f"Single backup from {date_str} — no duplicates",
+                    total_size,
+                    "(no action needed — keeping your only backup)",
+                    CAUTION)
+
+    # Android emulator snapshots
+    add("Android emulator data",
+        "AVD images and snapshots",
+        dir_size_if_exists(os.path.join(home, ".android", "avd")),
+        "Manage in Android Studio > Device Manager",
+        REVIEW)
+
+    # ── ~/.cache top offenders (cross-platform tools) ──
+    dot_cache = os.path.join(home, ".cache")
+    # Exclude dirs already reported separately
+    already_dot_cache = {"pip", "mozilla"}
+    if os.path.isdir(dot_cache):
+        try:
+            for entry in os.listdir(dot_cache):
+                if entry in already_dot_cache:
+                    continue
+                path = os.path.join(dot_cache, entry)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    size = du_size(path)
+                    if size >= 100_000_000:  # 100 MB+
+                        add(f"Cache: ~/.cache/{entry}",
+                            "CLI tool cache — will be re-downloaded as needed",
+                            size,
+                            f"rm -rf ~/.cache/{entry}")
+        except OSError:
+            pass
+
+    # Go module cache
+    go_cache = dir_size_if_exists(os.path.join(home, "go", "pkg", "mod", "cache"))
+    add("Go module cache",
+        "Cached Go module downloads",
+        go_cache,
+        "go clean -modcache")
+
+    # Docker (check if docker is available)
+    try:
+        r = subprocess.run(["docker", "system", "df", "--format", "{{.Size}}"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            # Just report that docker can be pruned, use the reclaimable info
+            r2 = subprocess.run(
+                ["docker", "system", "df", "--format", "{{.Reclaimable}}"],
+                capture_output=True, text=True, timeout=5)
+            if r2.returncode == 0:
+                reclaimable_lines = r2.stdout.strip().splitlines()
+                # Parse first reclaimable value as a rough indicator
+                total_reclaim = 0
+                for line in reclaimable_lines:
+                    line = line.strip().split()[0]  # e.g. "2.5GB"
+                    try:
+                        if "GB" in line:
+                            total_reclaim += float(line.replace("GB", "")) * 1_000_000_000
+                        elif "MB" in line:
+                            total_reclaim += float(line.replace("MB", "")) * 1_000_000
+                    except ValueError:
+                        pass
+                if total_reclaim > 0:
+                    add("Docker reclaimable",
+                        "Unused images, containers, build cache",
+                        int(total_reclaim),
+                        "docker system prune -a",
+                        REVIEW)
+    except (FileNotFoundError, Exception):
+        pass
+
+    return targets
+
+
+def print_clean():
+    home = os.path.expanduser("~")
+    print(f"  {dim('Scanning for cleanup opportunities...')}", end="", flush=True)
+    targets = get_cleanup_targets(home)
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+
+    # Filter to items > 50 MB
+    targets = [(n, d, s, h, r) for n, d, s, h, r in targets if s > 50_000_000]
+
+    if not targets:
+        print(f"  {green('No significant cleanup opportunities found.')}")
+        print()
+        return
+
+    # Sort: safe first, then review, then caution; within each group by size
+    risk_order = {SAFE: 0, REVIEW: 1, CAUTION: 2}
+    targets.sort(key=lambda x: (risk_order.get(x[4], 1), -x[2]))
+
+    total_reclaimable = sum(s for _, _, s, _, _ in targets)
+    max_name = max(len(n) for n, _, _, _, _ in targets)
+    max_name = max(max_name, 12)
+    line_width = max_name + 42
+
+    # Legend
+    print(f"  {bold('Cleanup Opportunities')}")
+    print(f"  {dim('─' * line_width)}")
+    legend_parts = []
+    for risk_key in (SAFE, REVIEW, CAUTION):
+        label, colorize, meaning = RISK_LABELS[risk_key]
+        legend_parts.append(f"{colorize(label)} {dim('=' + meaning)}")
+    print(f"  {dim('  '.join(legend_parts))}")
+    print(f"  {dim('─' * line_width)}")
+
+    current_risk = None
+    for name, desc, size, hint, risk in targets:
+        label, colorize, _ = RISK_LABELS[risk]
+        tag = colorize(f"[{label}]")
+
+        if current_risk is not None and risk != current_risk:
+            print(f"  {dim('·' * line_width)}")
+        current_risk = risk
+
+        print(f"  {tag}  {colorize(f'{name:<{max_name}}')}  {bold(fmt_bytes(size)):>9}")
+        print(f"         {dim(desc)}")
+        print(f"         {cyan(hint)}")
+        print()
+
+    print(f"  {dim('─' * line_width)}")
+    print(f"  {'Total reclaimable':<{max_name + 9}}  {bold(fmt_bytes(total_reclaimable)):>9}")
+    print()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+
+def print_dir_breakdown(target_dir):
+    """Show subdirectory sizes for a given directory."""
+    target_dir = os.path.abspath(os.path.expanduser(target_dir))
+    if not os.path.isdir(target_dir):
+        print(f"  {red(f'Not a directory: {target_dir}')}")
+        return
+
+    # Get total size of the target directory
+    total_size = du_size(target_dir)
+    total_count = file_count(target_dir)
+
+    print()
+    print(f"  {bold(target_dir)}")
+    print(f"  {fmt_bytes(total_size)} total, {fmt_count(total_count)}")
+    print()
+
+    # Scan subdirectories
+    entries = []
+    files_size = 0
+    files_count = 0
+
+    print(f"  {dim('Scanning...')}", end="", flush=True)
+
+    try:
+        for entry in sorted(os.listdir(target_dir)):
+            path = os.path.join(target_dir, entry)
+            if os.path.islink(path):
+                continue
+            if os.path.isdir(path):
+                size = du_size(path)
+                count = file_count(path)
+                if size > 0:
+                    entries.append((entry, size, count))
+                print(dim("."), end="", flush=True)
+            elif os.path.isfile(path):
+                try:
+                    files_size += os.path.getsize(path)
+                    files_count += 1
+                except OSError:
+                    pass
+    except OSError as e:
+        print(f"\r  {red(f'Cannot read directory: {e}')}")
+        return
+
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+
+    # Add loose files as a category
+    if files_size > 0:
+        entries.append(("[files in this dir]", files_size, files_count))
+
+    entries.sort(key=lambda x: -x[1])
+
+    if not entries:
+        print(f"  {dim('(empty directory)')}")
+        return
+
+    # Group small entries (<1% of total or < 10 MB) into "Other"
+    threshold = max(total_size * 0.01, 10_000_000)  # 1% or 10 MB
+    big = []
+    other_size = 0
+    other_count = 0
+    for name, size, count in entries:
+        if size >= threshold:
+            big.append((name, size, count))
+        else:
+            other_size += size
+            other_count += count
+
+    if other_size > 0:
+        big.append(("Other", other_size, other_count))
+
+    max_name = max(len(n) for n, _, _ in big)
+    max_name = max(max_name, 10)
+    line_width = max_name + 48
+
+    print(f"  {dim('─' * line_width)}")
+
+    detail_bar_width = 16
+    for name, size, count in big:
+        pct = size / total_size * 100 if total_size else 0
+        filled = int(round(pct / 100 * detail_bar_width))
+        empty = detail_bar_width - filled
+        is_other = name == "Other"
+        if is_other:
+            bar_str = dim("░" * detail_bar_width)
+            count_str = dim(fmt_count(count)) if count > 0 else ""
+            size_str = f"{fmt_bytes(size):>9}"
+            pct_str = f"{pct:>5.1f}%"
+            print(f"  {dim(f'{name:<{max_name}}')}  {dim(size_str)}  {bar_str}  {dim(pct_str)}  {count_str}")
+        else:
+            colorize = color_for_pct(pct)
+            bar_str = colorize("█" * filled) + dim("░" * empty)
+            count_str = dim(fmt_count(count)) if count > 0 else ""
+            print(f"  {name:<{max_name}}  {fmt_bytes(size):>9}  {bar_str}  {pct:>5.1f}%  {count_str}")
+
+    print(f"  {dim('─' * line_width)}")
+    print()
+
+
+# ── Big files finder ─────────────────────────────────────────────────────────
+
+import time as _time
+
+
+def age_color(mtime):
+    """Color based on file age: dim=recent, yellow=>6mo, red=>1yr."""
+    age_days = (_time.time() - mtime) / 86400
+    if age_days > 365:
+        return red
+    elif age_days > 180:
+        return yellow
+    return dim
+
+
+def age_label(mtime):
+    """Human-readable age string."""
+    age_days = int((_time.time() - mtime) / 86400)
+    if age_days > 365:
+        years = age_days / 365
+        return f"{years:.1f}y ago"
+    elif age_days > 30:
+        months = age_days / 30
+        return f"{months:.0f}mo ago"
+    elif age_days > 0:
+        return f"{age_days}d ago"
+    return "today"
+
+
+def find_big_files(search_dir, count=20):
+    """Find the largest files under search_dir using du + sort pipeline."""
+    import heapq
+
+    home = os.path.expanduser("~")
+    skip_prefixes = (
+        "/System/Volumes/",
+        os.path.join(home, ".Trash") + "/",
+        "/Library/Apple/System/",
+        # Cloud storage — not actually on disk
+        os.path.join(home, "Google Drive") + "/",
+        os.path.join(home, "OneDrive") + "/",
+        os.path.join(home, "Dropbox") + "/",
+        os.path.join(home, "Library", "CloudStorage") + "/",
+        os.path.join(home, "Library", "Mobile Documents") + "/",  # iCloud
+    )
+
+    # Walk the filesystem in Python — much faster than find -exec stat
+    # We only keep the top N using a min-heap
+    heap = []  # min-heap of (size, mtime, path)
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(search_dir):
+            # Skip system dirs
+            if any(dirpath.startswith(p) for p in skip_prefixes):
+                dirnames.clear()
+                continue
+            for fname in filenames:
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    st = os.lstat(fpath)
+                    if not stat_module.S_ISREG(st.st_mode):
+                        continue
+                    size = st.st_size
+                    if len(heap) < count:
+                        heapq.heappush(heap, (size, st.st_mtime, fpath))
+                    elif size > heap[0][0]:
+                        heapq.heapreplace(heap, (size, st.st_mtime, fpath))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    # Return sorted biggest first
+    heap.sort(key=lambda x: -x[0])
+    return heap
+
+
+def print_big_files(search_dir, count=20):
+    """Print the biggest files."""
+    print()
+    print(f"  {bold(f'Biggest files in {search_dir}')}")
+    print(f"  {dim('Scanning (this may take a moment)...')}", end="", flush=True)
+
+    files = find_big_files(search_dir, count)
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+
+    if not files:
+        print(f"  {dim('No files found.')}")
+        print()
+        return
+
+    home = os.path.expanduser("~")
+
+    print(f"  {dim('─' * 70)}")
+
+    for size, mtime, path in files:
+        display = path.replace(home, "~")
+        ac = age_color(mtime)
+        al = age_label(mtime)
+
+        print(f"  {bold(fmt_bytes(size)):>9}  {ac(f'{al:>8}')}  {display}")
+
+    print(f"  {dim('─' * 70)}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pretty disk usage analysis for macOS",
+    )
+    parser.add_argument(
+        "directory", nargs="?", default=None,
+        help="Show subdirectory breakdown for this directory",
+    )
+    parser.add_argument(
+        "--details", "-d",
+        action="store_true",
+        help="Show storage breakdown by category (like System Settings > Storage)",
+    )
+    parser.add_argument(
+        "--clean", "-c",
+        action="store_true",
+        help="Scan for cleanup opportunities (caches, temp files, old downloads)",
+    )
+    parser.add_argument(
+        "--big", "-b",
+        action="store_true",
+        help="Find the 20 biggest files (default: /, or in given directory)",
+    )
+    args = parser.parse_args()
+
+    if args.big:
+        search_dir = os.path.abspath(os.path.expanduser(args.directory)) if args.directory else "/"
+        print_big_files(search_dir)
+        return
+
+    if args.directory:
+        print_dir_breakdown(args.directory)
+        return
+
+    disks = get_disks()
+    print_disks(disks)
+
+    if args.details:
+        print_details(disks)
+
+    if args.clean:
+        print_clean()
+
+
+if __name__ == "__main__":
+    main()
