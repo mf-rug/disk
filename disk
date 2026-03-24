@@ -99,7 +99,7 @@ def get_diskutil_info(device):
     """Get volume info from diskutil."""
     try:
         r = subprocess.run(
-            ["diskutil", "info", device],
+            ["/usr/sbin/diskutil", "info", device],
             capture_output=True, text=True, timeout=5,
         )
         info = {}
@@ -135,7 +135,7 @@ def parse_df_line(line):
 
 def get_disks():
     """Parse df and return list of meaningful disks."""
-    r = subprocess.run(["df", "-b"], capture_output=True, text=True)
+    r = subprocess.run(["/bin/df", "-b"], capture_output=True, text=True)
     disks = []
     boot_device = None
 
@@ -261,10 +261,11 @@ def du_size(path):
     """Get total size of a path in bytes using du."""
     try:
         r = subprocess.run(
-            ["du", "-sk", path],
+            ["/usr/bin/du", "-sk", path],
             capture_output=True, text=True, timeout=30,
         )
-        if r.returncode == 0 and r.stdout.strip():
+        # du may return rc=1 due to permission errors but still output a total
+        if r.stdout.strip():
             return int(r.stdout.split()[0]) * 1024
     except Exception:
         pass
@@ -275,7 +276,7 @@ def file_count(path):
     """Count files in a directory (fast — just reads dir entries)."""
     try:
         r = subprocess.run(
-            ["find", path, "-type", "f"],
+            ["/usr/bin/find", path, "-type", "f"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, timeout=30,
         )
@@ -372,7 +373,7 @@ def print_details(disks):
     if hidden_total > 0:
         final.append(("Caches & App Data", hidden_total, hidden_count))
     if system_size > 0:
-        final.append(("macOS System", system_size, 0))
+        final.append(("System & Other", system_size, 0))
     if other_total > 0:
         final.append(("Other", other_total, other_count))
 
@@ -793,6 +794,105 @@ def get_cleanup_targets(home):
     except (FileNotFoundError, Exception):
         pass
 
+    # ── Homebrew checks ──
+    try:
+        # Check if brew exists
+        subprocess.run(["brew", "--prefix"], capture_output=True, timeout=5)
+        brew_prefix = "/opt/homebrew"
+        if not os.path.isdir(brew_prefix):
+            brew_prefix = "/usr/local"
+
+        # 1. Orphaned Python lib directories
+        lib_dir = os.path.join(brew_prefix, "lib")
+        if os.path.isdir(lib_dir):
+            try:
+                for entry in os.listdir(lib_dir):
+                    if not entry.startswith("python3."):
+                        continue
+                    # Extract version like "3.10" from "python3.10"
+                    pyver = entry.replace("python", "")
+                    # Check if the corresponding formula is installed
+                    r = subprocess.run(
+                        ["brew", "list", f"python@{pyver}"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if r.returncode != 0:
+                        # Formula not installed — orphaned lib dir
+                        path = os.path.join(lib_dir, entry)
+                        size = du_size(path)
+                        add(f"Orphaned {entry} libs",
+                            f"python@{pyver} is not installed — leftover files",
+                            size,
+                            f"rm -rf {path}")
+            except OSError:
+                pass
+
+        # 2. brew cleanup (stale downloads, old versions)
+        try:
+            r = subprocess.run(
+                ["brew", "cleanup", "--dry-run"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                # Count files and estimate size
+                cleanup_files = [
+                    l.strip() for l in r.stdout.splitlines()
+                    if l.strip() and os.path.exists(l.strip())
+                ]
+                cleanup_size = sum(
+                    os.path.getsize(f) if os.path.isfile(f) else du_size(f)
+                    for f in cleanup_files
+                )
+                add("Homebrew stale files",
+                    f"{len(cleanup_files)} old downloads/versions to clean up",
+                    cleanup_size,
+                    "brew cleanup")
+        except Exception:
+            pass
+
+        # 3. Multiple versions of the same formula (e.g. postgresql@14, @15, @16)
+        try:
+            r = subprocess.run(
+                ["brew", "list", "--formula"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                from collections import defaultdict
+                versioned = defaultdict(list)  # base_name -> [full_name, ...]
+                for formula in r.stdout.splitlines():
+                    formula = formula.strip()
+                    if "@" in formula:
+                        base = formula.split("@")[0]
+                        versioned[base].append(formula)
+                for base, versions in versioned.items():
+                    if len(versions) < 2:
+                        continue
+                    # Get sizes
+                    ver_info = []
+                    for v in sorted(versions):
+                        cellar_path = os.path.join(brew_prefix, "Cellar", v)
+                        size = dir_size_if_exists(cellar_path)
+                        ver_info.append((v, size))
+                    total = sum(s for _, s in ver_info)
+                    if total < 50_000_000:
+                        continue
+                    ver_list = ", ".join(v for v, _ in ver_info)
+                    # Suggest keeping the latest
+                    oldest = ver_info[:-1]
+                    oldest_size = sum(s for _, s in oldest)
+                    oldest_names = " ".join(v for v, _ in oldest)
+                    if oldest_size > 0:
+                        add(f"Multiple {base} versions",
+                            f"Installed: {ver_list} — consider keeping only the latest",
+                            oldest_size,
+                            f"brew uninstall {oldest_names}  (check: brew uses --installed {oldest_names})",
+                            REVIEW)
+        except Exception:
+            pass
+
+    except (FileNotFoundError, Exception):
+        pass
+
     return targets
 
 
@@ -1056,13 +1156,117 @@ def print_big_files(search_dir, count=20):
     print()
 
 
+def print_system_details(disks):
+    """Drill into the 'System & Other' bucket."""
+    boot = next((d for d in disks if d["is_boot"]), None)
+    if not boot:
+        print(f"  {red('Could not identify boot volume.')}")
+        return
+
+    home = os.path.expanduser("~")
+
+    # First compute what ~/  and /Applications account for (same as print_details)
+    categories, system_size = scan_categories(home, boot["used"])
+
+    if system_size <= 0:
+        print(f"  {dim('No unaccounted system storage.')}")
+        return
+
+    print(f"  {bold('System & Other Breakdown')}")
+    print(f"  {dim(f'{fmt_bytes(system_size)} unaccounted — scanning system directories...')}")
+    print(f"  {dim('Run with sudo for full accuracy: sudo disk system')}")
+    print()
+
+    # Scan the major system directories
+    # NOTE: /System is excluded — it's a firmlinked APFS volume that
+    # shares blocks with the Data volume, so du massively double-counts it.
+    # Its actual unique size is ~15 GB but du reports ~800+ GB.
+    system_dirs = [
+        ("/opt/homebrew", "Homebrew (Apple Silicon)"),
+        ("/usr/local", "Homebrew (Intel) & local tools"),
+        ("/Library", "System-wide app support & frameworks"),
+        ("/private/var", "System data, databases, logs, VM"),
+    ]
+
+    # Other users
+    try:
+        current_user = os.path.basename(home)
+        for entry in os.listdir("/Users"):
+            if entry in (current_user, "Shared", ".localized"):
+                continue
+            user_path = os.path.join("/Users", entry)
+            if os.path.isdir(user_path) and not os.path.islink(user_path):
+                system_dirs.append((user_path, f"User: {entry}"))
+    except OSError:
+        pass
+
+    entries = []
+    print(f"  {dim('Scanning...')}", end="", flush=True)
+
+    for path, label in system_dirs:
+        if not os.path.exists(path):
+            continue
+        size = du_size(path)
+        if size > 0:
+            entries.append((label, size))
+        print(dim("."), end="", flush=True)
+
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+
+    # Calculate remainder (snapshots, purgeable, stuff du can't see)
+    scanned = sum(s for _, s in entries)
+    remainder = max(0, system_size - scanned)
+
+    # Group small entries
+    threshold = max(system_size * 0.02, 50_000_000)  # 2% or 50 MB
+    big = []
+    other = 0
+    for name, size in entries:
+        if size >= threshold:
+            big.append((name, size))
+        else:
+            other += size
+
+    if remainder > 0:
+        big.append(("Unscanned (needs sudo) + snapshots", remainder))
+    if other > 0:
+        big.append(("Other system dirs", other))
+
+    big.sort(key=lambda x: -x[1])
+
+    max_name = max(len(n) for n, _ in big) if big else 10
+    max_name = max(max_name, 26)
+    line_width = max_name + 35
+
+    print(f"  {dim('─' * line_width)}")
+
+    detail_bar_width = 16
+    for name, size in big:
+        pct = size / system_size * 100 if system_size else 0
+        filled = int(round(pct / 100 * detail_bar_width))
+        empty = detail_bar_width - filled
+        is_remainder = name in ("Unscanned (needs sudo) + snapshots", "Other system dirs")
+        if is_remainder:
+            bar_str = dim("░" * detail_bar_width)
+            size_str = f"{fmt_bytes(size):>9}"
+            pct_str = f"{pct:>5.1f}%"
+            print(f"  {dim(f'{name:<{max_name}}')}  {dim(size_str)}  {bar_str}  {dim(pct_str)}")
+        else:
+            colorize = color_for_pct(pct)
+            bar_str = colorize("█" * filled) + dim("░" * empty)
+            print(f"  {name:<{max_name}}  {fmt_bytes(size):>9}  {bar_str}  {pct:>5.1f}%")
+
+    print(f"  {dim('─' * line_width)}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pretty disk usage analysis for macOS",
     )
     parser.add_argument(
         "directory", nargs="?", default=None,
-        help="Show subdirectory breakdown for this directory",
+        help="Show subdirectory breakdown for a directory, or 'system' to drill into System & Other",
     )
     parser.add_argument(
         "--details", "-d",
@@ -1087,7 +1291,12 @@ def main():
         return
 
     if args.directory:
-        print_dir_breakdown(args.directory)
+        if args.directory.lower() == "system":
+            disks = get_disks()
+            print_disks(disks)
+            print_system_details(disks)
+        else:
+            print_dir_breakdown(args.directory)
         return
 
     disks = get_disks()
@@ -1095,6 +1304,9 @@ def main():
 
     if args.details:
         print_details(disks)
+        # Hint about system drill-down
+        print(f"  {dim('Tip: run `disk system` to drill into System & Other')}")
+        print()
 
     if args.clean:
         print_clean()
